@@ -361,6 +361,12 @@ def acquire_wrapper_lock(path):
 def build_parser():
     parser = argparse.ArgumentParser(
         description="Запись двух камер и LiDAR в одну сессию (три процесса).")
+    parser.add_argument(
+        "--mode",
+        choices=("cameras", "lidar", "all"),
+        default="all",
+        help="что записывать: камеры, lidar или всё вместе",
+    )
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT,
                         help="корень сессий (default: ~/recordings)")
     parser.add_argument("--device-left", default="/dev/video2")
@@ -408,23 +414,35 @@ def main(argv=None):
         print("Требуется 0 < --critical-free-mib < --min-free-mib",
               file=sys.stderr)
         return 1
-    try:
-        mode = record_profiles.resolve_mode(args.width, args.height, args.fps)
-        profile = record_profiles.make_profile(
-            mode["mode"], args.exposure_dynamic_framerate, args.seconds)
-    except record_profiles.ProfileError as exc:
-        print(f"Недопустимый профиль: {exc}", file=sys.stderr)
-        return 1
+    camera_mode = None
+    profile = None
 
-    recorder = Path(__file__).resolve().with_name("record_camera_pyav_queue.py")
-    if not recorder.is_file():
-        print(f"Не найден рекордер рядом с wrapper: {recorder}", file=sys.stderr)
-        return 1
+    if args.mode in ("cameras", "all"):
+        try:
+            camera_mode = record_profiles.resolve_mode(
+                args.width, args.height, args.fps)
+            profile = record_profiles.make_profile(
+                camera_mode["mode"],
+                args.exposure_dynamic_framerate,
+                args.seconds,
+            )
+        except record_profiles.ProfileError as exc:
+            print(f"Недопустимый профиль: {exc}", file=sys.stderr)
+            return 1
 
-    lidar_recorder = Path(__file__).resolve().with_name("lidar_recorder.py")
-    if not lidar_recorder.is_file():
-        print(f"Не найден LiDAR-рекордер: {lidar_recorder}", file=sys.stderr)
-        return 1
+        recorder = Path(__file__).resolve().with_name(
+            "record_camera_pyav_queue.py")
+        if not recorder.is_file():
+            print(f"Не найден рекордер: {recorder}", file=sys.stderr)
+            return 1
+
+    if args.mode in ("lidar", "all"):
+        lidar_recorder = Path(__file__).resolve().with_name(
+            "lidar_recorder.py")
+        if not lidar_recorder.is_file():
+            print(f"Не найден LiDAR-рекордер: {lidar_recorder}",
+                  file=sys.stderr)
+            return 1
 
     lock_handle = None
     try:
@@ -454,36 +472,40 @@ def main(argv=None):
 
     exit_code = 1
     try:
-        devices = [args.device_left, args.device_right]
-        try:
-            report = preflight.run_preflight(
-                args.output_root, devices,
-                min_free_mib=args.min_free_mib,
-                critical_free_mib=args.critical_free_mib,
-                v4l2_ctl=args.v4l2_ctl,
-                mode=mode,
-                exposure_dynamic_framerate=(
-                    profile["exposure_dynamic_framerate"]),
-            )
-        except (preflight.PreflightError, OSError) as exc:
-            print(f"Preflight failed: {exc}", file=sys.stderr)
-            return 1
+        if args.mode in ("cameras", "all"):
+            devices = [args.device_left, args.device_right]
+            try:
+                report = preflight.run_preflight(
+                    args.output_root, devices,
+                    min_free_mib=args.min_free_mib,
+                    critical_free_mib=args.critical_free_mib,
+                    v4l2_ctl=args.v4l2_ctl,
+                    mode=camera_mode,
+                    exposure_dynamic_framerate=(
+                        profile["exposure_dynamic_framerate"]),
+                )
+            except (preflight.PreflightError, OSError) as exc:
+                print(f"Preflight failed: {exc}", file=sys.stderr)
+                return 1
 
-        space = report["space"]
-        print(f"Profile: {profile['mode']} "
-              f"dynamic={profile['exposure_dynamic_framerate']} "
-              f"duration={profile['duration_seconds']:g}s", flush=True)
-        print("Preflight: режим подтверждён обеими камерами; "
-              f"{preflight.EXPOSURE_CONTROL}="
-              f"{profile['exposure_dynamic_framerate']} установлен и "
-              "подтверждён на "
-              + ", ".join(item["device"] for item in report["cameras"]),
-              flush=True)
+            space = report["space"]
+            print(f"Profile: {profile['mode']} "
+                  f"dynamic={profile['exposure_dynamic_framerate']} "
+                  f"duration={profile['duration_seconds']:g}s",
+                  flush=True)
+            print("Preflight: обе камеры готовы", flush=True)
+        else:
+            try:
+                space = preflight.ensure_output_root(
+                    args.output_root, args.min_free_mib)
+            except (preflight.PreflightError, OSError) as exc:
+                print(f"Preflight failed: {exc}", file=sys.stderr)
+                return 1
+
         print(f"Preflight: свободно {space['free_mib']:.0f} MiB "
               f"(порог запуска {args.min_free_mib} MiB, "
               f"критический резерв {args.critical_free_mib} MiB)",
               flush=True)
-
         try:
             session = create_session(args.output_root)
         except OSError as exc:
@@ -495,36 +517,38 @@ def main(argv=None):
         print(f"Сессия: {session}", flush=True)
 
         commands = []
-        for spec in CAMERAS:
-            device = getattr(args, spec["device_arg"])
-            output_dir = session / spec["dir"]
+
+        if args.mode in ("cameras", "all"):
+            for spec in CAMERAS:
+                device = getattr(args, spec["device_arg"])
+                output_dir = session / spec["dir"]
+                commands.append({
+                    "key": spec["id"],
+                    "log_name": f"{spec['dir']}.log",
+                    "argv": build_recorder_command(
+                        sys.executable, recorder, spec, device,
+                        output_dir, args),
+                })
+                print(f"{spec['id']}: {device} -> {output_dir}",
+                      flush=True)
+
+        if args.mode in ("lidar", "all"):
+            lidar_output = session / "lidar"
             commands.append({
-                "key": spec["id"],
-                "log_name": f"{spec['dir']}.log",
-                "argv": build_recorder_command(
-                    sys.executable, recorder, spec, device, output_dir, args),
+                "key": "lidar",
+                "log_name": "lidar.log",
+                "argv": build_lidar_command(
+                    sys.executable, lidar_recorder,
+                    lidar_output, args.seconds,
+                ),
             })
-            print(f"{spec['id']}: {device} -> {output_dir}", flush=True)
-
-        lidar_output = session / "lidar"
-
-        commands.append({
-            "key": "lidar",
-            "log_name": "lidar.log",
-            "argv": build_lidar_command(
-                sys.executable,
-                lidar_recorder,
-                lidar_output,
-                args.seconds,
-            ),
-        })
-
-        print(f"lidar: fake -> {lidar_output}", flush=True)
+            print(f"lidar: fake -> {lidar_output}", flush=True)
 
         try:
             children = start_children(commands, session)
         except BaseException as exc:
-            print(f"Ошибка запуска рекордеров: {type(exc).__name__}: {exc}",
+            print(f"Ошибка запуска рекордеров: "
+                  f"{type(exc).__name__}: {exc}",
                   file=sys.stderr)
             return 1
 
@@ -552,7 +576,7 @@ def main(argv=None):
         if result["error"]:
             print(result["error"], file=sys.stderr)
         if exit_code == 0:
-            print("Обе записи завершены и прошли проверку.", flush=True)
+            print(f"Запись ({args.mode}) завершена.", flush=True)
         else:
             print("Запись завершена с ошибкой; смотрите метаданные и логи.",
                   file=sys.stderr)

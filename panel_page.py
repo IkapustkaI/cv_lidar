@@ -97,7 +97,9 @@ PANEL_HTML = """<!doctype html>
     <div class="row">
       <button id="preview-start" type="button">Включить просмотр обеих камер</button>
       <button id="preview-stop" type="button">Остановить просмотр</button>
-      <button id="record-start" type="button" class="danger">Начать запись обеих камер</button>
+      <button id="record-start-cameras" type="button" class="danger">Только камеры</button>
+      <button id="record-start-lidar" type="button" class="danger">Только LiDAR</button>
+      <button id="record-start-all" type="button" class="danger">Камеры + LiDAR</button>
       <button id="record-stop" type="button" class="danger">Остановить запись</button>
       <button id="error-ack" type="button">Сбросить ошибку</button>
     </div>
@@ -277,7 +279,7 @@ async function api(path, options) {
   return body;
 }
 
-async function post(command) {
+async function post(command, payload = {}) {
   if (busy) return;
   busy = true;
   render();
@@ -285,7 +287,7 @@ async function post(command) {
     await api("/api/" + command, {
       method: "POST",
       headers: {"Content-Type": "application/json"},
-      body: "{}",
+      body: JSON.stringify(payload),
     });
   } catch (error) {
     if (command.startsWith("profile/")) profileFeedback(error.message, true);
@@ -419,8 +421,12 @@ document.getElementById("preview-start").addEventListener("click",
   () => post("preview/start"));
 document.getElementById("preview-stop").addEventListener("click",
   () => post("preview/stop"));
-document.getElementById("record-start").addEventListener("click",
-  () => post("record/start"));
+document.getElementById("record-start-cameras").addEventListener("click",
+  () => post("record/start", {mode: "cameras"}));
+document.getElementById("record-start-lidar").addEventListener("click",
+  () => post("record/start", {mode: "lidar"}));
+document.getElementById("record-start-all").addEventListener("click",
+  () => post("record/start", {mode: "all"}));
 document.getElementById("record-stop").addEventListener("click",
   () => post("record/stop"));
 document.getElementById("error-ack").addEventListener("click",
@@ -431,7 +437,14 @@ function allowed(command, status) {
   const state = status.state;
   if (command === "preview/start") return state === "idle" && profileReady(status) && !profileDirty && !status.profile_locked;
   if (command === "preview/stop") return state === "preview";
-  if (command === "record/start") return ["idle", "preview"].includes(state) && profileReady(status) && !profileDirty && !(status.state === "idle" && status.profile_locked);
+  if (command === "record/start-cameras" || command === "record/start-all") {
+    return ["idle", "preview"].includes(state) &&
+      profileReady(status) && !profileDirty &&
+      !(state === "idle" && status.profile_locked);
+  }
+  if (command === "record/start-lidar") {
+    return ["idle", "preview"].includes(state);
+  }
   if (command === "record/stop") return state === "recording" || (state === "starting" && status.operation === "record");
   if (command === "error/ack") return state === "error";
   return false;
@@ -453,6 +466,15 @@ function renderCamera(cam, status) {
   const info = cameraStatus(status, cam.key);
   card.dot.className = "dot";
   card.error.hidden = true;
+  const recording = status && status.recording || {};
+
+  if (
+    recording.mode === "lidar" &&
+    (recording.active || ["recording", "stopping"].includes(status.state))
+  ) {
+    card.details.textContent = "Камера не участвует в записи LiDAR";
+    return;
+  }
   if (!info) {
     card.details.textContent = "нет данных";
   } else if (status.state === "recording" || status.state === "stopping" ||
@@ -534,6 +556,16 @@ function renderRecordInfo(status) {
       String(status.recording.exit_code)],
     ["Последняя ошибка", status.last_error || "—"],
   ];
+  if (["lidar", "all"].includes(status.recording.mode)) {
+    const lidar = status.recording.lidar || {};
+
+    rows.push(
+      ["LiDAR status", lidar.status || "—"],
+      ["LiDAR packets", String(lidar.packet_count ?? 0)],
+      ["LiDAR invalid packets", String(lidar.invalid_packets ?? 0)],
+      ["LiDAR error", lidar.error || "—"]
+    );
+  }
   if (status.disk && status.disk.error) {
     rows.push(["Ошибка disk_usage", status.disk.error]);
   }
@@ -585,8 +617,15 @@ function render() {
     ("сессия: " + (status.recording.session || "—")) : "нет связи";
   setMessage(status ? status.message : "подключение…", !!(status && status.state === "error"));
 
-  for (const command of ["preview/start", "preview/stop", "record/start",
-                         "record/stop", "error/ack"]) {
+  for (const command of [
+    "preview/start",
+    "preview/stop",
+    "record/start-cameras",
+    "record/start-lidar",
+    "record/start-all",
+    "record/stop",
+    "error/ack"
+  ]) {
     document.getElementById(command === "error/ack" ? "error-ack" :
       command.replace("/", "-")).disabled = !allowed(command, status);
   }

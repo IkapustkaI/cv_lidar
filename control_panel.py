@@ -467,6 +467,7 @@ class PanelController:
         self._mode_probe_thread = None
         self._launch_profile = dict(self._profile)
         self._record_profile = None
+        self._record_mode = None
         self._preview_profile = None
         self._record_preview = None
         self._record_preview_error = None
@@ -720,6 +721,8 @@ class PanelController:
             profile_info = self._profile_snapshot()
             record_profile = (dict(self._record_profile)
                               if self._record_profile else None)
+            record_mode = self._record_mode
+            lidar_metadata = dict(self._metadata.get("lidar") or {})
 
         active = runner is not None and exit_code is None
         if active and started is not None:
@@ -728,6 +731,19 @@ class PanelController:
             elapsed = result.get("duration_s")
         else:
             elapsed = None
+        recording_mode = (
+            record_mode
+            if operation == "record"
+            and state in ("starting", "recording", "stopping")
+            else None
+        )
+
+        lidar_info = {
+            "status": lidar_metadata.get("status"),
+            "packet_count": lidar_metadata.get("packet_count", 0),
+            "invalid_packets": lidar_metadata.get("invalid_packets", 0),
+            "error": lidar_metadata.get("error"),
+        }
 
         return {
             **profile_info,
@@ -741,6 +757,7 @@ class PanelController:
             "preview": preview_info,
             "recording": {
                 "active": active,
+                "mode": recording_mode,
                 "profile": record_profile,
                 "session": str(session) if session else None,
                 "elapsed_s": round(elapsed, 1) if elapsed is not None else None,
@@ -748,6 +765,7 @@ class PanelController:
                 "forced": bool(forced),
                 "exit_code": exit_code,
                 "cameras": cameras,
+                "lidar": lidar_info,
             },
             "disk": disk,
             "limits": {
@@ -852,7 +870,8 @@ class PanelController:
         if self._stuck_preview is not None:
             self._clear_finished_stuck()
 
-    def handle_command(self, command):
+    def handle_command(self, command, body=None):
+        body = body or {}
         if command == "profile/check":
             self._request_mode_probe()
             self._publish()
@@ -882,20 +901,29 @@ class PanelController:
             elif command == "record/start":
                 if state not in ("idle", "preview"):
                     raise CommandError(409, f"недоступно в состоянии {state}")
-                self._require_profile_support(self._profile)
-                self._launch_profile = dict(self._profile)
-                self._record_profile = dict(self._profile)
+
+                record_mode = body.get("mode", "all")
+                if record_mode not in ("cameras", "lidar", "all"):
+                    raise CommandError(400, "неизвестный режим записи")
+
+                self._record_mode = record_mode
+
+                if record_mode in ("cameras", "all"):
+                    self._require_profile_support(self._profile)
+                    self._launch_profile = dict(self._profile)
+                    self._record_profile = dict(self._profile)
+                else:
+                    self._record_profile = None
+
                 self._state = "starting"
                 self._operation = "record"
-                self._message = "Подготовка записи обеих камер…"
+                self._message = f"Подготовка записи: {record_mode}…"
                 self._last_error = None
                 self._stop_requested = False
                 self._stop_reason = None
                 self._forced = False
                 self._readiness_failed = False
                 self._result = None
-                # Код предыдущего wrapper сохраняется до установки нового runner:
-                # иначе _detect_conflicts сочтёт завершённый процесс работающим.
                 self._record_started = None
                 action = self._run_record_start
             elif command == "record/stop":
@@ -983,8 +1011,13 @@ class PanelController:
             self._conflicts = []
 
         with self._lock:
-            profile = dict(self._launch_profile)
-        mode = record_profiles.require_mode(profile["mode"])
+            record_mode = self._record_mode or "all"
+            profile = dict(self._launch_profile) if record_mode in (
+                "cameras", "all") else None
+
+        mode = None
+        if profile is not None:
+            mode = record_profiles.require_mode(profile["mode"])
         if not self.config.fake_cameras:
             try:
                 for device in (self.config.device_left, self.config.device_right):
@@ -1108,25 +1141,47 @@ class PanelController:
             return {"active": False, "source": "recorder", "cameras": {},
                     "error": f"{type(exc).__name__}: {exc}"}
 
-    def _build_record_argv(self):
+    def _build_record_argv(self, record_mode="all"):
         with self._lock:
-            profile = dict(self._launch_profile)
-        mode = record_profiles.require_mode(profile["mode"])
+            record_mode = self._record_mode or record_mode
+            profile = (
+                dict(self._launch_profile)
+                if record_mode in ("cameras", "all")
+                else None
+            )
+
+        mode = None
+        if profile is not None:
+            mode = record_profiles.require_mode(profile["mode"])
+
         script = self.config.dual_script
         if not script:
             script = str(Path(__file__).resolve().with_name(
                 "record_dual_session.py"))
+
         command = [
             sys.executable, str(Path(script).resolve()),
+            "--mode", record_mode,
             "--output-root", str(Path(self.config.output_root).expanduser()),
-            "--device-left", self.config.device_left,
-            "--device-right", self.config.device_right,
-            "--seconds", f"{profile['duration_seconds']:g}",
-            "--width", str(mode["width"]),
-            "--height", str(mode["height"]),
-            "--fps", f"{mode['fps']:g}",
-            "--exposure-dynamic-framerate",
-            str(profile["exposure_dynamic_framerate"]),
+            "--seconds", (
+                f"{profile['duration_seconds']:g}"
+                if profile is not None
+                else f"{self.config.record_seconds:g}"
+            ),
+        ]
+
+        if record_mode in ("cameras", "all"):
+            command.extend([
+                "--device-left", self.config.device_left,
+                "--device-right", self.config.device_right,
+                "--width", str(mode["width"]),
+                "--height", str(mode["height"]),
+                "--fps", f"{mode['fps']:g}",
+                "--exposure-dynamic-framerate",
+                str(profile["exposure_dynamic_framerate"]),
+            ])
+
+        command.extend([
             "--v4l2-ctl", self.config.v4l2_ctl,
             "--segment-seconds", f"{self.config.segment_seconds:g}",
             "--queue-frames", str(self.config.queue_frames),
@@ -1134,11 +1189,14 @@ class PanelController:
             "--min-free-mib", str(self.config.min_free_mib),
             "--critical-free-mib", str(self.config.critical_free_mib),
             "--lock-file", str(Path(self.config.record_lock_file).expanduser()),
-        ]
+        ])
+
         with self._lock:
             app = self._record_preview
+
         if app is not None:
             command.extend(["--preview-root", str(app.directory)])
+
         return command
 
 
@@ -1170,8 +1228,9 @@ class PanelController:
                 self._wrapper_error = line.strip()
 
     def _ensure_trackers(self, session):
-        if not session:
+        if not session or self._record_mode == "lidar":
             return
+
         for spec in preview.CAMERA_SPECS:
             key = spec["key"]
             if key not in self._trackers:
@@ -1182,38 +1241,72 @@ class PanelController:
         session = self._record_session_path
         if not session:
             return {}
+
         metadata = {}
+
         for spec in preview.CAMERA_SPECS:
             path = session / CAMERA_DIRS[spec["key"]] / "session_metadata.json"
             data = read_metadata(path)
             if data is not None:
                 metadata[spec["key"]] = data
+
+        lidar_path = session / "lidar" / "session_metadata.json"
+        lidar_data = read_metadata(lidar_path)
+        if lidar_data is not None:
+            metadata["lidar"] = lidar_data
+
         return metadata
 
     def _readiness_reached(self):
         with self._lock:
             session = self._record_session_path
+            record_mode = self._record_mode or "all"
+
         if not session:
             return False
+
         metadata = self._read_record_metadata()
-        if len(metadata) != 2:
-            return False
-        if any(meta.get("status") != "recording"
-               for meta in metadata.values()):
-            return False
-        for spec in preview.CAMERA_SPECS:
-            directory = session / CAMERA_DIRS[spec["key"]]
-            try:
-                with os.scandir(directory) as entries:
-                    has_segment = any(
-                        entry.name.endswith(".mkv") and entry.is_file()
-                        and entry.stat().st_size > 0
-                        for entry in entries
-                    )
-            except OSError:
-                has_segment = False
-            if not has_segment:
+
+        # Проверка LiDAR.
+        if record_mode in ("lidar", "all"):
+            lidar = metadata.get("lidar")
+            if not lidar or lidar.get("status") != "recording":
                 return False
+
+            lidar_csv = session / "lidar" / "packets.csv"
+            if not lidar_csv.is_file():
+                return False
+
+        # Проверка камер.
+        if record_mode in ("cameras", "all"):
+            camera_metadata = [
+                metadata.get(spec["key"])
+                for spec in preview.CAMERA_SPECS
+            ]
+
+            if any(
+                not meta or meta.get("status") != "recording"
+                for meta in camera_metadata
+            ):
+                return False
+
+            for spec in preview.CAMERA_SPECS:
+                directory = session / CAMERA_DIRS[spec["key"]]
+
+                try:
+                    with os.scandir(directory) as entries:
+                        has_segment = any(
+                            entry.name.endswith(".mkv")
+                            and entry.is_file()
+                            and entry.stat().st_size > 0
+                            for entry in entries
+                        )
+                except OSError:
+                    has_segment = False
+
+                if not has_segment:
+                    return False
+
         return True
 
     def _run_record_start(self):
@@ -1243,8 +1336,13 @@ class PanelController:
                 self._stop_requested = False
                 return
 
-        self._prepare_record_preview()
-        argv = self._build_record_argv()
+        with self._lock:
+            record_mode = self._record_mode or "all"
+
+        if record_mode in ("cameras", "all"):
+            self._prepare_record_preview()
+
+        argv = self._build_record_argv(record_mode)
         runner = self.runner_factory(argv, self._on_record_line)
         with self._lock:
             if self._shutdown.is_set() or self._stop_requested:
@@ -1384,30 +1482,69 @@ class PanelController:
 
             now = self.clock()
             metadata = self._read_record_metadata()
+
             with self._lock:
                 self._metadata.update(metadata)
+                record_mode = self._record_mode or "all"
                 self._ensure_trackers(session)
                 trackers = dict(self._trackers)
+
             for tracker in trackers.values():
                 tracker.rescan(now)
 
             verification = {}
-            for spec in preview.CAMERA_SPECS:
-                meta = metadata.get(spec["key"]) or {}
-                verification[spec["key"]] = meta.get("status") or "missing"
+
+            # Проверка камер.
+            if record_mode in ("cameras", "all"):
+                for spec in preview.CAMERA_SPECS:
+                    meta = metadata.get(spec["key"]) or {}
+                    verification[spec["key"]] = meta.get("status") or "missing"
+
+            # Проверка LiDAR.
+            if record_mode in ("lidar", "all"):
+                lidar = metadata.get("lidar") or {}
+                lidar_status = lidar.get("status") or "missing"
+                packet_count = lidar.get("packet_count", 0)
+
+                lidar_csv = session / "lidar" / "packets.csv" if session else None
+
+                try:
+                    csv_valid = (
+                        lidar_csv is not None
+                        and lidar_csv.is_file()
+                        and lidar_csv.stat().st_size > 0
+                    )
+                except OSError:
+                    csv_valid = False
+
+                lidar_verified = (
+                    lidar_status == "stopped"
+                    and packet_count > 0
+                    and csv_valid
+                )
+
+                verification["lidar"] = (
+                    "verified" if lidar_verified
+                    else f"{lidar_status}, packets={packet_count}, csv={csv_valid}"
+                )
+
             verified = all(
-                status == "verified" for status in verification.values())
+                status == "verified" for status in verification.values()
+            )
 
             if stop_reason is None:
-                reasons = [
-                    (metadata.get(spec["key"]) or {}).get("stop_reason")
-                    for spec in preview.CAMERA_SPECS
-                ]
-                if reasons and all(reason == "duration_limit"
-                                   for reason in reasons):
-                    stop_reason = "duration_limit"
-                elif any(reason == "user_stop" for reason in reasons):
-                    stop_reason = "остановка оператором"
+                if record_mode in ("cameras", "all"):
+                    reasons = [
+                        (metadata.get(spec["key"]) or {}).get("stop_reason")
+                        for spec in preview.CAMERA_SPECS
+                    ]
+                    if reasons and all(reason == "duration_limit" for reason in reasons):
+                        stop_reason = "duration_limit"
+                    elif any(reason == "user_stop" for reason in reasons):
+                        stop_reason = "РѕСЃС‚Р°РЅРѕРІРєР° РѕРїРµСЂР°С‚РѕСЂРѕРј"
+
+                if stop_reason is None and record_mode in ("lidar", "all"):
+                    stop_reason = (metadata.get("lidar") or {}).get("stop_reason")
 
             outcome = "ok"
             error = None
@@ -1802,7 +1939,7 @@ class PanelHandler(preview.PreviewHandler):
             if command == "profile/apply":
                 result = self.server.panel.apply_profile(body)
             else:
-                result = self.server.panel.handle_command(command)
+                result = self.server.panel.handle_command(command, body)
         except CommandError as exc:
             return self._send_json(
                 exc.status, {"ok": False, "message": str(exc)})
