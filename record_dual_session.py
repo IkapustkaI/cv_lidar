@@ -115,6 +115,14 @@ def build_recorder_command(python, recorder, spec, device, output_dir, options):
         command.extend(["--preview-root", str(options.preview_root)])
     return command
 
+def build_lidar_command(python, recorder, output_dir, seconds):
+    return [
+        str(python),
+        str(recorder),
+        "--output-dir", str(output_dir),
+        "--seconds", f"{seconds:g}",
+    ]
+
 
 def _alive(children):
     return [child for child in children if child.process.poll() is None]
@@ -352,7 +360,7 @@ def acquire_wrapper_lock(path):
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="Запись обеих камер в одну сессию (два рекордера).")
+        description="Запись двух камер и LiDAR в одну сессию (три процесса).")
     parser.add_argument("--output-root", default=DEFAULT_OUTPUT_ROOT,
                         help="корень сессий (default: ~/recordings)")
     parser.add_argument("--device-left", default="/dev/video2")
@@ -411,6 +419,11 @@ def main(argv=None):
     recorder = Path(__file__).resolve().with_name("record_camera_pyav_queue.py")
     if not recorder.is_file():
         print(f"Не найден рекордер рядом с wrapper: {recorder}", file=sys.stderr)
+        return 1
+
+    lidar_recorder = Path(__file__).resolve().with_name("lidar_recorder.py")
+    if not lidar_recorder.is_file():
+        print(f"Не найден LiDAR-рекордер: {lidar_recorder}", file=sys.stderr)
         return 1
 
     lock_handle = None
@@ -492,6 +505,21 @@ def main(argv=None):
                     sys.executable, recorder, spec, device, output_dir, args),
             })
             print(f"{spec['id']}: {device} -> {output_dir}", flush=True)
+
+        lidar_output = session / "lidar"
+
+        commands.append({
+            "key": "lidar",
+            "log_name": "lidar.log",
+            "argv": build_lidar_command(
+                sys.executable,
+                lidar_recorder,
+                lidar_output,
+                args.seconds,
+            ),
+        })
+
+        print(f"lidar: fake -> {lidar_output}", flush=True)
 
         try:
             children = start_children(commands, session)
