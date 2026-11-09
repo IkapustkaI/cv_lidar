@@ -1,1 +1,3 @@
 *.pyc
+test_lidar/
+test_lidar_2/

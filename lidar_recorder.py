@@ -171,9 +171,20 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--mode",
-        choices=("fake",),
+        choices=("fake", "serial"),
         default="fake",
-        help="источник данных; пока реализован только fake",
+        help="Источник данных: fake или serial",
+    )
+    parser.add_argument(
+        "--port",
+        default="/dev/ttyUSB0",
+        help="Последовательный порт LiDAR",
+    )
+    parser.add_argument(
+        "--baudrate",
+        type=int,
+        default=230400,
+        help="Скорость UART",
     )
     parser.add_argument(
         "--seconds",
@@ -319,18 +330,185 @@ def run_fake(args: argparse.Namespace) -> int:
         save_json(metadata_path, metadata)
         raise
 
+def run_serial(args: argparse.Namespace) -> int:
+    global _stop_requested
+    _stop_requested = False
+
+    import serial
+
+    if args.seconds < 0:
+        raise ValueError("--seconds должен быть >= 0")
+    if args.baudrate <= 0:
+        raise ValueError("--baudrate должен быть > 0")
+
+    output_dir = Path(args.output_dir).expanduser()
+    output_dir.mkdir(parents=True, exist_ok=False)
+
+    metadata_path = output_dir / "session_metadata.json"
+    csv_path = output_dir / "packets.csv"
+
+    metadata = {
+        "sensor": "FHL-LD19",
+        "source_mode": "serial",
+        "port": args.port,
+        "baudrate": args.baudrate,
+        "status": "starting",
+        "started_at_utc": datetime.now(timezone.utc).isoformat(),
+        "finished_at_utc": None,
+        "packet_count": 0,
+        "invalid_packets": 0,
+        "packet_size_bytes": PACKET_SIZE,
+        "points_per_packet": POINTS_PER_PACKET,
+        "error": None,
+    }
+    save_json(metadata_path, metadata)
+
+    fields = [
+        "packet_id",
+        "host_receive_monotonic_ns",
+        "host_receive_utc_ns",
+        "sensor_timestamp_ms",
+        "speed_deg_s",
+        "start_angle_deg",
+        "end_angle_deg",
+        "points_json",
+        "raw_packet_hex",
+        "crc_valid",
+    ]
+
+    signal.signal(signal.SIGINT, request_stop)
+    if hasattr(signal, "SIGTERM"):
+        signal.signal(signal.SIGTERM, request_stop)
+
+    deadline = (
+        time.monotonic() + args.seconds if args.seconds > 0 else None
+    )
+
+    try:
+        with serial.Serial(
+            args.port,
+            args.baudrate,
+            timeout=0.2,
+        ) as ser:
+            metadata["status"] = "recording"
+            save_json(metadata_path, metadata)
+
+            buffer = bytearray()
+
+            with csv_path.open(
+                "w", newline="", encoding="utf-8"
+            ) as handle:
+                writer = csv.DictWriter(handle, fieldnames=fields)
+                writer.writeheader()
+
+                packet_id = 0
+
+                while not _stop_requested:
+                    if deadline is not None and time.monotonic() >= deadline:
+                        break
+
+                    chunk = ser.read(ser.in_waiting or 1)
+
+                    if not chunk:
+                        continue
+
+                    buffer.extend(chunk)
+
+                    while True:
+                        header_index = buffer.find(bytes([PACKET_HEADER]))
+
+                        if header_index < 0:
+                            buffer.clear()
+                            break
+
+                        if header_index > 0:
+                            del buffer[:header_index]
+
+                        if len(buffer) < PACKET_SIZE:
+                            break
+
+                        packet = bytes(buffer[:PACKET_SIZE])
+
+                        try:
+                            parsed = parse_packet(packet)
+                        except ValueError:
+                            metadata["invalid_packets"] += 1
+                            del buffer[0]
+                            continue
+
+                        host_mono_ns = time.monotonic_ns()
+                        host_utc_ns = time.time_ns()
+
+                        writer.writerow({
+                            "packet_id": packet_id,
+                            "host_receive_monotonic_ns": host_mono_ns,
+                            "host_receive_utc_ns": host_utc_ns,
+                            "sensor_timestamp_ms":
+                                parsed["sensor_timestamp_ms"],
+                            "speed_deg_s": parsed["speed_deg_s"],
+                            "start_angle_deg":
+                                parsed["start_angle_deg"],
+                            "end_angle_deg": parsed["end_angle_deg"],
+                            "points_json": json.dumps(
+                                parsed["points"],
+                                separators=(",", ":"),
+                            ),
+                            "raw_packet_hex": packet.hex(),
+                            "crc_valid": 1,
+                        })
+
+                        packet_id += 1
+                        metadata["packet_count"] = packet_id
+
+                        del buffer[:PACKET_SIZE]
+
+                        if packet_id % 20 == 0:
+                            handle.flush()
+                            save_json(metadata_path, metadata)
+
+                handle.flush()
+
+        metadata["status"] = "stopped"
+        metadata["finished_at_utc"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+        save_json(metadata_path, metadata)
+
+        print(
+            f"LiDAR serial: записано пакетов "
+            f"{metadata['packet_count']} в {output_dir}",
+            flush=True,
+        )
+
+        return 0
+
+    except BaseException as exc:
+        metadata["status"] = "failed"
+        metadata["error"] = f"{type(exc).__name__}: {exc}"
+        metadata["finished_at_utc"] = datetime.now(
+            timezone.utc
+        ).isoformat()
+        save_json(metadata_path, metadata)
+        raise
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
+
     try:
-        return run_fake(args)
+        if args.mode == "fake":
+            return run_fake(args)
+
+        if args.mode == "serial":
+            return run_serial(args)
+
+        raise ValueError(f"Неизвестный режим: {args.mode}")
+
     except Exception as exc:
         print(
             f"Ошибка LiDAR-регистратора: {type(exc).__name__}: {exc}",
             file=sys.stderr,
         )
         return 1
-
 
 if __name__ == "__main__":
     raise SystemExit(main())
