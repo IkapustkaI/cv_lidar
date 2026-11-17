@@ -62,6 +62,9 @@ class LidarCommandTests(unittest.TestCase):
         self.assertEqual(command, [
             "/venv/bin/python",
             "/opt/lidar_recorder.py",
+            "--mode", "serial",
+            "--port", "/dev/ttyUSB0",
+            "--baudrate", "230400",
             "--output-dir", "/tmp/session/lidar",
             "--seconds", "12",
         ])

@@ -119,6 +119,9 @@ def build_lidar_command(python, recorder, output_dir, seconds):
     return [
         str(python),
         str(recorder),
+        "--mode", "serial",
+        "--port", "/dev/ttyUSB0",
+        "--baudrate", "230400",
         "--output-dir", str(output_dir),
         "--seconds", f"{seconds:g}",
     ]
@@ -542,7 +545,7 @@ def main(argv=None):
                     lidar_output, args.seconds,
                 ),
             })
-            print(f"lidar: fake -> {lidar_output}", flush=True)
+            print(f"lidar: serial (/dev/ttyUSB0, 230400 baud) -> {lidar_output}", flush=True)
 
         try:
             children = start_children(commands, session)
