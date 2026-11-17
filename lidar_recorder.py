@@ -193,6 +193,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="длительность записи; 0 — до остановки оператором",
     )
     parser.add_argument(
+        "--rotation-seconds",
+        type=float,
+        default=1200.0,
+        help="интервал создания нового CSV-файла в секундах (по умолчанию 1200 — 20 минут)",
+    )
+    parser.add_argument(
         "--fake-packet-rate",
         type=float,
         default=375.0,
@@ -340,6 +346,8 @@ def run_serial(args: argparse.Namespace) -> int:
         raise ValueError("--seconds должен быть >= 0")
     if args.baudrate <= 0:
         raise ValueError("--baudrate должен быть > 0")
+    if args.rotation_seconds <= 0:
+        raise ValueError("--rotation-seconds должен быть > 0")
 
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=False)
@@ -395,14 +403,23 @@ def run_serial(args: argparse.Namespace) -> int:
 
             buffer = bytearray()
 
-            with csv_path.open(
+            packet_id = 0
+            file_index = 1
+            file_started_at = time.monotonic()
+
+            current_csv_path = csv_path
+            handle = current_csv_path.open(
                 "w", newline="", encoding="utf-8"
-            ) as handle:
-                writer = csv.DictWriter(handle, fieldnames=fields)
-                writer.writeheader()
+            )
 
-                packet_id = 0
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
 
+            metadata["csv_files"] = [current_csv_path.name]
+            metadata["csv_rotation_seconds"] = args.rotation_seconds
+            save_json(metadata_path, metadata)
+
+            try:
                 while not _stop_requested:
                     if deadline is not None and time.monotonic() >= deadline:
                         break
@@ -436,6 +453,32 @@ def run_serial(args: argparse.Namespace) -> int:
                             del buffer[0]
                             continue
 
+                        now = time.monotonic()
+
+                        # Создаём новый CSV после истечения интервала.
+                        if now - file_started_at >= args.rotation_seconds:
+                            handle.flush()
+                            handle.close()
+
+                            file_index += 1
+                            current_csv_path = output_dir / (
+                                f"packets_{file_index:04d}.csv"
+                            )
+
+                            handle = current_csv_path.open(
+                                "w", newline="", encoding="utf-8"
+                            )
+                            writer = csv.DictWriter(
+                                handle, fieldnames=fields
+                            )
+                            writer.writeheader()
+
+                            file_started_at = now
+                            metadata["csv_files"].append(
+                                current_csv_path.name
+                            )
+                            save_json(metadata_path, metadata)
+
                         host_mono_ns = time.monotonic_ns()
                         host_utc_ns = time.time_ns()
 
@@ -467,6 +510,9 @@ def run_serial(args: argparse.Namespace) -> int:
                             save_json(metadata_path, metadata)
 
                 handle.flush()
+            finally:
+                handle.close()
+
 
         metadata["status"] = "stopped"
         metadata["finished_at_utc"] = datetime.now(
